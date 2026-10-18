@@ -31,7 +31,9 @@ import {
 import {
   resolveWakaruCommand,
   type WakaruLauncher,
+  type WakaruWarning,
   WakaruCleanupFailure,
+  WakaruPreparationCleanupFailure,
 } from "./WakaruCommand.js";
 import type { ProviderProcessSupervisor } from "../../process/ProviderProcess.js";
 import { prepareWakaruExecution } from "./WakaruExecution.js";
@@ -49,6 +51,10 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
         root: string | undefined;
         process: ProviderProcessSupervisor | undefined;
         tree: SafeOutputTree | undefined;
+        /** Failed launch preparation still owning its helper root. */
+        preparation: WakaruPreparationCleanupFailure | undefined;
+        /** Caller-facing cleanup error resolved once this work completes. */
+        failure: ProviderCleanupError | undefined;
       }
     | undefined;
 
@@ -57,6 +63,8 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
       Record<string, string | undefined>
     > = process.env,
     readonly launcher?: WakaruLauncher,
+    /** Destination for host-capability warnings; absent means silence. */
+    readonly warning?: WakaruWarning,
   ) {}
 
   /** Recover selected scripts using validated reports and verified output bytes. */
@@ -107,7 +115,9 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
     const deadline = performance.now() + RECOVERY_LIMITS.timeoutMs;
     try {
       checkRecoveryCancellation(options?.signal);
-      const engine = await resolveWakaruCommand(this.environment);
+      const engine = await resolveWakaruCommand(this.environment, {
+        ...(this.warning === undefined ? {} : { warn: this.warning }),
+      });
       root = await mkdtemp(join(tmpdir(), "rea-wakaru-"));
       const inputs = join(root, "inputs");
       const staging = join(root, "modules");
@@ -159,6 +169,13 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
         failure instanceof WakaruCleanupFailure
           ? failure.cleanupOwner
           : undefined;
+      const preparation =
+        failure instanceof WakaruPreparationCleanupFailure
+          ? failure
+          : undefined;
+      if (preparation !== undefined)
+        for (const resource of preparation.cleanupResources)
+          if (!residuals.includes(resource)) residuals.push(resource);
       let failedTree: SafeOutputTree | undefined;
       try {
         await tree?.rollback();
@@ -187,50 +204,64 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
           });
         }
       }
-      if (
+      const pending =
         cleanupOwner !== undefined ||
+        preparation !== undefined ||
         failedTree !== undefined ||
         root !== undefined
-      ) {
-        this.#pendingCleanup = {
-          root,
-          process: cleanupOwner,
-          tree: failedTree,
-        };
+          ? {
+              root,
+              process: cleanupOwner,
+              tree: failedTree,
+              preparation,
+              failure: undefined as ProviderCleanupError | undefined,
+            }
+          : undefined;
+      if (pending !== undefined) {
+        this.#pendingCleanup = pending;
         if (root !== undefined) residuals.push(root);
         root = undefined;
       }
-      if (residuals.length > 0)
-        return err(
-          new ProviderCleanupError(
-            "wakaru",
-            residuals,
-            {
-              ...(failure instanceof WakaruCleanupFailure
-                ? failure.diagnostics
-                : {}),
-              previous_error:
-                failure instanceof WakaruCleanupFailure
-                  ? (failure.diagnostics?.previous_error ?? null)
-                  : recoveryFailureMessage(failure),
-              cleanup_failures: cleanupFailures,
-            },
-            {
-              operation: OPERATION,
-              cause: failure,
-              ...(tree?.published && execution !== undefined
-                ? {
-                    partialObservation: {
-                      kind: "javascript-recovery" as const,
-                      result: javascriptRecoveryResultSchema.parse(
-                        execution.result,
-                      ),
-                    },
-                  }
-                : {}),
-            },
-          ),
+      if (residuals.length > 0) {
+        // Confirmed cleanup must reveal the typed primary for ordinary
+        // workspace failures too, not only failures that already retained one.
+        const cleanupPrimary =
+          failure instanceof AnalysisError
+            ? (failure.cleanupPrimary ??
+              (failure.cleanupIncomplete ? undefined : failure))
+            : undefined;
+        const cleanupFailure = new ProviderCleanupError(
+          "wakaru",
+          residuals,
+          {
+            ...(failure instanceof WakaruCleanupFailure
+              ? failure.diagnostics
+              : {}),
+            previous_error:
+              failure instanceof WakaruCleanupFailure
+                ? (failure.diagnostics?.previous_error ?? null)
+                : recoveryFailureMessage(failure),
+            cleanup_failures: cleanupFailures,
+          },
+          {
+            operation: OPERATION,
+            cause: failure,
+            ...(cleanupPrimary === undefined ? {} : { cleanupPrimary }),
+            ...(tree?.published && execution !== undefined
+              ? {
+                  partialObservation: {
+                    kind: "javascript-recovery" as const,
+                    result: javascriptRecoveryResultSchema.parse(
+                      execution.result,
+                    ),
+                  },
+                }
+              : {}),
+          },
         );
+        if (pending !== undefined) pending.failure = cleanupFailure;
+        return err(cleanupFailure);
+      }
       if (tree?.published === true && execution !== undefined)
         return ok(execution);
       return err(
@@ -266,6 +297,38 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
   async #retire(): Promise<ProviderCleanupError | undefined> {
     const pending = this.#pendingCleanup;
     if (pending === undefined) return undefined;
+    if (pending.preparation !== undefined) {
+      const preparation = pending.preparation;
+      try {
+        await preparation.cleanupOwner.close();
+      } catch (cause: unknown) {
+        // The helper root is still owned; report it instead of a clean close.
+        void cause;
+      }
+      if (preparation.preparation.cleanupFailure?.cleanupIncomplete === true) {
+        // This retry still owns the helper root: resolve it with the owner's
+        // next success instead of leaving a released path reported as live.
+        const retryFailure = new ProviderCleanupError(
+          "wakaru",
+          [...preparation.cleanupResources],
+          {
+            reason: recoveryFailureMessage(
+              preparation.preparation.cleanupFailure,
+            ),
+          },
+          {
+            operation: OPERATION,
+            cause: preparation,
+            ...(preparation.cleanupPrimary === undefined
+              ? {}
+              : { cleanupPrimary: preparation.cleanupPrimary }),
+          },
+        );
+        return retryFailure.bindCleanupDependencies([preparation]);
+      }
+      preparation.resolveCleanup();
+      pending.preparation = undefined;
+    }
     if (pending.process !== undefined) {
       const stopped = await pending.process.stop();
       if (stopped.status === "incomplete")
@@ -309,6 +372,8 @@ export class WakaruProvider implements JavaScriptRecoveryPort {
       }
     }
     this.#pendingCleanup = undefined;
+    // Every retained resource confirmed release; reveal the reported primary.
+    pending.failure?.resolveCleanup();
     return undefined;
   }
 }
